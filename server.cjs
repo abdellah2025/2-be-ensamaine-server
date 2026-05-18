@@ -12,33 +12,45 @@ const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const admin = require("firebase-admin");
 const { v4: uuidv4 } = require("uuid");
 
-// Express + CORS
+// ─── Express App ─────────────────────────────────────────────────────────────
 const app = express();
+
+// ─── CORS (global — couvre TOUTES les réponses, y compris 401/400/500) ───────
+const ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "http://localhost:5174",
+  "https://be-ensamaine.web.app",
+  "https://2beensamaine.com",
+];
+
 app.use(
   cors({
-    origin: [
-      "http://localhost:5173", // Vite dev
-      "http://localhost:5174",
-      "https://be-ensamaine.web.app", // Firebase Hosting
-      "https://2beensamaine.com", // Domain
-    ],
+    origin: (origin, callback) => {
+      // Autoriser les requêtes sans Origin (Postman, mobile, curl…)
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("CORS: origin non autorisée — " + origin));
+      }
+    },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 200, // Compatibilité IE11
   })
 );
+
 app.use(express.json());
 
-// Multer (للملفات في الذاكرة)
+// ─── Multer (fichiers en mémoire) ────────────────────────────────────────────
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Firebase Admin
+// ─── Firebase Admin ──────────────────────────────────────────────────────────
 let db = null;
 let auth = null;
+
 if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   try {
-    const serviceAccount = JSON.parse(
-      process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-    );
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     db = admin.firestore();
     auth = admin.auth();
@@ -47,12 +59,10 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
     console.error("Invalid FIREBASE_SERVICE_ACCOUNT_JSON ❌", e.message);
   }
 } else {
-  console.warn(
-    "⚠️ FIREBASE_SERVICE_ACCOUNT_JSON not provided — token check disabled"
-  );
+  console.warn("⚠️  FIREBASE_SERVICE_ACCOUNT_JSON absent — vérification token désactivée");
 }
 
-// Cloudflare R2 client
+// ─── Cloudflare R2 (compatible S3) ───────────────────────────────────────────
 const s3 = new S3Client({
   region: process.env.R2_REGION || "auto",
   endpoint: process.env.R2_ENDPOINT,
@@ -62,32 +72,35 @@ const s3 = new S3Client({
   },
 });
 
-// Middleware للتحقق من التوكن (اختياري)
+// ─── Helper : vérification optionnelle du token Firebase ─────────────────────
 async function verifyTokenIfPresent(req) {
   if (!auth) return null;
-  const token = (req.headers.authorization || "").replace("Bearer ", "");
+  const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
   if (!token) return null;
   try {
     const decoded = await auth.verifyIdToken(token);
     return decoded.uid;
   } catch (e) {
-    console.warn("Invalid token:", e.message);
+    console.warn("Token invalide :", e.message);
     return null;
   }
 }
 
-// Preflight لجميع الـ OPTIONS
-app.options(/.*/, (req, res) => {
-  res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Authorization,Content-Type");
-  res.sendStatus(200);
+// ─── Health-check ────────────────────────────────────────────────────────────
+app.get("/", (_req, res) => {
+  res.json({
+    status: "ok",
+    service: "2beensamaine-backend",
+    timestamp: new Date().toISOString(),
+  });
 });
 
-// 📌 Upload endpoint
+// ─── POST /upload ─────────────────────────────────────────────────────────────
 app.post("/upload", upload.single("file"), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: "file missing" });
+    if (!req.file) {
+      return res.status(400).json({ error: "Aucun fichier reçu" });
+    }
 
     const folder = req.body.folder || "uploads";
     const safeName = req.file.originalname.replace(/\s+/g, "_");
@@ -102,26 +115,30 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       })
     );
 
-    res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
     return res.json({ key });
   } catch (err) {
-    console.error("Upload error:", err);
-    res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
-    return res.status(500).json({ error: err.message || "upload failed" });
+    console.error("Erreur /upload :", err);
+    return res.status(500).json({ error: err.message || "Upload échoué" });
   }
 });
 
-// 📌 Media endpoint (Presigned URL)
+// ─── GET /media ───────────────────────────────────────────────────────────────
 app.get("/media", async (req, res) => {
   try {
     const fileKey = req.query.file;
-    if (!fileKey) return res.status(400).json({ error: "file missing" });
+    if (!fileKey) {
+      return res.status(400).json({ error: "Paramètre 'file' manquant" });
+    }
 
-    const uid = await verifyTokenIfPresent(req);
+    // Comparaison robuste : "true" / "True" / "TRUE" → tous acceptés
+    const isPublic =
+      String(process.env.PUBLIC_MEDIA).toLowerCase() === "true";
 
-    // إذا كان PUBLIC_MEDIA != true يجب وجود مستخدم
-    if (process.env.PUBLIC_MEDIA !== "true" && !uid) {
-      return res.status(401).json({ error: "Authentication required" });
+    if (!isPublic) {
+      const uid = await verifyTokenIfPresent(req);
+      if (!uid) {
+        return res.status(401).json({ error: "Authentification requise" });
+      }
     }
 
     const getCmd = new GetObjectCommand({
@@ -129,20 +146,17 @@ app.get("/media", async (req, res) => {
       Key: fileKey,
     });
 
-    const url = await getSignedUrl(s3, getCmd, { expiresIn: 300 }); // 5 دقائق
-    res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
-
+    const url = await getSignedUrl(s3, getCmd, { expiresIn: 300 }); // 5 min
     return res.json({ url, expiresIn: 300 });
   } catch (err) {
-    console.error("Media error:", err);
-    res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*");
-    return res.status(500).json({ error: err.message || "server error" });
+    console.error("Erreur /media :", err);
+    return res.status(500).json({ error: err.message || "Erreur serveur" });
   }
 });
 
-// Run server
+// ─── Démarrage ────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000;
-console.log("Bucket =", process.env.R2_BUCKET);
+console.log("Bucket   =", process.env.R2_BUCKET);
 console.log("Endpoint =", process.env.R2_ENDPOINT);
 console.log("PUBLIC_MEDIA =", process.env.PUBLIC_MEDIA);
-app.listen(PORT, () => console.log("🚀 Server listening on", PORT));
+app.listen(PORT, () => console.log(`🚀 Serveur en écoute sur le port ${PORT}`));
